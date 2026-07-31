@@ -35,6 +35,34 @@ def _find_bgm(bgm_dir: str = "assets/bgm") -> str | None:
     return None
 
 
+def _escape_path_for_filter(path: str) -> str:
+    """ffmpeg 필터 옵션(subtitles= 등) 안에 경로를 넣을 때 콜론을 이스케이프합니다."""
+    return os.path.abspath(path).replace("\\", "/").replace(":", "\\:")
+
+
+def _build_subtitle_filter(srt_path: str) -> str:
+    """SRT 자막을 화면 하단에 번인하는 subtitles 필터 문자열을 만듭니다."""
+    escaped = _escape_path_for_filter(srt_path)
+    force_style = (
+        "FontName=NanumGothic,FontSize=13,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=3,Outline=1,Shadow=0,"
+        "Alignment=2,MarginV=110"
+    )
+    return f"subtitles='{escaped}':force_style='{force_style}'"
+
+
+def _build_normalize_filter(width: int, height: int, factor: int = 2) -> str:
+    """임의 비율의 원본 사진을 목표 해상도의 factor배 크기로 스케일+크롭합니다.
+    zoompan 이전에 적용하면 원본 사진의 가로세로 비율과 무관하게
+    왜곡 없이 9:16 프레임을 채울 수 있습니다.
+    (사전 렌더링된 1080x1920 슬라이드에 적용해도 사실상 변화가 없어 안전합니다.)
+    """
+    return (
+        f"scale=-2:{height * factor}:force_original_aspect_ratio=increase,"
+        f"crop={width * factor}:{height * factor}"
+    )
+
+
 def _build_zoom_filter(
     width: int, height: int, fps: int, duration: float,
     transition_duration: float, slide_index: int,
@@ -80,9 +108,23 @@ def _create_slide_clip(
     transition_duration: float,
     tts_path: str | None = None,
     slide_index: int = 0,
+    subtitle_path: str | None = None,
+    normalize_source: bool = False,
 ) -> bool:
-    """단일 슬라이드를 비디오 클립으로 변환합니다 (Ken Burns 효과 포함)."""
-    vf = _build_zoom_filter(1080, 1920, fps, duration, transition_duration, slide_index)
+    """단일 슬라이드/사진을 비디오 클립으로 변환합니다 (Ken Burns 효과 포함).
+
+    normalize_source=True면 원본 사진의 비율이 9:16이 아니어도 스케일+크롭으로
+    왜곡 없이 프레임을 채웁니다 (현장형 모드의 실제 사진용).
+    subtitle_path가 주어지면 해당 클립 구간에 자막을 번인합니다.
+    """
+    zoom_vf = _build_zoom_filter(1080, 1920, fps, duration, transition_duration, slide_index)
+    vf_parts = []
+    if normalize_source:
+        vf_parts.append(_build_normalize_filter(1080, 1920, factor=2))
+    vf_parts.append(zoom_vf)
+    if subtitle_path:
+        vf_parts.append(_build_subtitle_filter(subtitle_path))
+    vf = ",".join(vf_parts)
 
     if tts_path:
         cmd = [
@@ -115,7 +157,12 @@ def _create_slide_clip(
         # fallback: zoompan 없이 기본 fade만 적용
         fade_frames = int(fps * transition_duration)
         fade_out_start = int(fps * (duration - transition_duration))
-        simple_vf = f"scale=1080:1920,fade=in:0:{fade_frames},fade=out:{fade_out_start}:{fade_frames}"
+        simple_parts = [_build_normalize_filter(1080, 1920, factor=1)] if normalize_source else ["scale=1080:1920"]
+        simple_parts.append(f"fade=in:0:{fade_frames}")
+        simple_parts.append(f"fade=out:{fade_out_start}:{fade_frames}")
+        if subtitle_path:
+            simple_parts.append(_build_subtitle_filter(subtitle_path))
+        simple_vf = ",".join(simple_parts)
 
         if tts_path:
             cmd_simple = [
@@ -354,6 +401,106 @@ def create_video(
     if os.path.exists(output_path):
         file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
         print(f"✅ 영상 생성 완료!")
+        print(f"   📁 파일: {output_path}")
+        print(f"   📊 크기: {file_size:.1f} MB")
+        return output_path
+    else:
+        raise RuntimeError("영상 파일이 생성되지 않았습니다.")
+
+
+def create_onsite_video(
+    photo_paths: list,
+    output_path: str,
+    tts_data: list,
+    subtitle_paths: list | None = None,
+    fps: int = 30,
+    transition_duration: float = 0.5,
+    min_duration: float = 2.5,
+) -> str:
+    """현장형(Before/작업중/After 사진) 숏폼 영상을 합성합니다.
+
+    photo_paths, tts_data, subtitle_paths는 반드시 같은 순서로 1:1 대응해야
+    합니다 (사진 순서 = 대본 문단 순서 = 나레이션/자막 순서). 사진은 원본
+    비율과 무관하게 스케일+크롭으로 9:16 프레임에 왜곡 없이 채워집니다.
+    """
+    if not _check_ffmpeg():
+        print("❌ ffmpeg가 설치되어 있지 않습니다!")
+        raise RuntimeError("ffmpeg not found")
+
+    if not photo_paths:
+        raise ValueError("사진이 없습니다!")
+
+    if len(tts_data) != len(photo_paths):
+        raise ValueError(
+            f"사진 수({len(photo_paths)})와 나레이션 수({len(tts_data)})가 일치하지 않습니다. "
+            "사진 순서와 대본 문단 수를 맞춰주세요."
+        )
+
+    if subtitle_paths is not None and len(subtitle_paths) != len(photo_paths):
+        raise ValueError("자막 파일 수가 사진 수와 일치하지 않습니다.")
+
+    print("🎬 현장형 영상 생성 중... (사진 + TTS 나레이션 + 자막)")
+
+    out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(output_path))[0]
+    temp_dir = os.path.join(out_dir, f"_temp_onsite_{base_name}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    temp_videos = []
+    for i, photo_path in enumerate(photo_paths):
+        tts_info = tts_data[i]
+        clip_duration = max(tts_info["duration"] + 0.5, min_duration)
+        subtitle_path = subtitle_paths[i] if subtitle_paths else None
+
+        temp_video = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
+        success = _create_slide_clip(
+            slide_path=photo_path,
+            output_path=temp_video,
+            duration=clip_duration,
+            fps=fps,
+            transition_duration=transition_duration,
+            tts_path=tts_info["path"],
+            slide_index=i,
+            subtitle_path=subtitle_path,
+            normalize_source=True,
+        )
+        if not success:
+            print(f"  ⚠️  사진 {i + 1} 변환 중 오류 발생")
+        temp_videos.append(temp_video)
+        print(f"  📹 사진 {i + 1}/{len(photo_paths)} 변환 완료 ({clip_duration:.1f}초)")
+
+    concat_file = os.path.join(temp_dir, "concat_list.txt")
+    with open(concat_file, "w") as f:
+        for video in temp_videos:
+            f.write(f"file '{os.path.abspath(video)}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", concat_file,
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    print("  🔧 최종 영상 렌더링 중...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"❌ 영상 생성 실패: {result.stderr[:500]}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+
+    print("  🧹 임시 파일 정리 중...")
+    try:
+        shutil.rmtree(temp_dir)
+    except Exception:
+        pass
+
+    if os.path.exists(output_path):
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        print("✅ 현장형 영상 생성 완료!")
         print(f"   📁 파일: {output_path}")
         print(f"   📊 크기: {file_size:.1f} MB")
         return output_path

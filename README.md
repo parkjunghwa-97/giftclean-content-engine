@@ -1,11 +1,122 @@
-# 🎬 AI Shorts Generator (숏츠 영상 자동 생성기)
+# 🧹 기프트클린 콘텐츠 엔진
 
-> Gemini API + TTS 나레이션을 활용하여 유튜브 숏츠 / 릴스 / 틱톡용 세로 영상을 자동으로 생성하는 도구입니다.
+> [Daewooki/simple-shorts-generator](https://github.com/Daewooki/simple-shorts-generator) (MIT)를
+> 기반으로, 기프트클린 콘텐츠전략 SOP에 맞춰 만든 숏폼 생성기입니다.
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Gemini](https://img.shields.io/badge/Google-Gemini%20API-orange.svg)](https://ai.google.dev/)
-[![TTS](https://img.shields.io/badge/TTS-edge--tts-purple.svg)](https://github.com/rany2/edge-tts)
+
+## 🏗️ 현장형 숏폼 (1차 MVP)
+
+Before / 작업 중 / After 사진을 순서대로 올리고, 실제 현장 내용을 바탕으로
+**사람이 직접 쓴 대본**에 TTS 나레이션 + SRT 자막을 입혀 9:16 영상을 만듭니다.
+**대본·사진순서·개인정보 체크를 사람이 승인해야만 최종 렌더링이 진행되며,
+완전 무인 게시 기능은 없습니다.**
+
+### 사전 준비
+
+```bash
+pip install -r requirements.txt
+```
+
+ffmpeg가 설치되어 있어야 합니다 (`sudo apt install ffmpeg` / `brew install ffmpeg` /
+Windows는 상단 "⚡ 빠른 시작" 참고). edge-tts는 온라인 상태에서만 동작합니다.
+
+### 1. 프로젝트 생성 + 사진 등록
+
+사진 순서 = `--photo`를 입력한 순서입니다. phase는 `before`/`during`/`after` 중 하나.
+
+```bash
+python onsite_main.py init --project my-site-001 \
+  --photo /path/to/before.jpg:before \
+  --photo /path/to/during.jpg:during \
+  --photo /path/to/after.jpg:after
+```
+
+사진은 `projects/my-site-001/photos/`로 복사되고, 사진마다 하나씩
+`projects/my-site-001/script.txt` 템플릿이 자동 생성됩니다.
+
+사진 순서를 나중에 바꾸려면(문단도 자동으로 같이 재정렬됩니다):
+
+```bash
+python onsite_main.py list --project my-site-001       # 현재 순서/파일명 확인
+python onsite_main.py reorder --project my-site-001 --order 01_during.jpg 00_before.jpg 02_after.jpg
+```
+
+### 2. 대본 작성 (사람이 직접 입력 — AI 자동 생성 없음)
+
+`projects/my-site-001/script.txt` 파일을 열어 `# [번호] phase - 파일명` 아래 줄에
+**실제 현장 내용**을 바탕으로 대본을 작성하세요. `#`으로 시작하는 줄은 주석입니다.
+
+### 3. TTS 나레이션 + 자막 생성
+
+```bash
+python onsite_main.py audio --project my-site-001
+```
+
+문단별로 TTS(edge-tts, 무료) 나레이션과 그 길이에 맞춘 SRT 자막을 생성합니다.
+
+### 4. 개인정보 마스킹 체크
+
+```bash
+python onsite_main.py check --project my-site-001 --photo 00_before.jpg \
+  --face yes --address yes --nameplate yes --mail yes
+```
+
+얼굴/주소/명패/우편물이 사진에 노출되지 않았는지(혹은 마스킹 처리했는지) 사진마다 확인합니다.
+자동 인식은 하지 않으며, 사람이 직접 확인한 결과만 기록합니다.
+
+### 5. 검수 및 승인 (렌더링 전 필수 관문)
+
+콘솔에서 확인:
+
+```bash
+python onsite_main.py review --project my-site-001
+```
+
+사진과 함께 눈으로 보면서 승인하려면 로컬 웹 화면을 사용하세요:
+
+```bash
+python review_server.py
+# 브라우저에서 http://127.0.0.1:5000 접속 → 프로젝트 클릭
+# 대본/사진순서(위로·아래로 버튼)/개인정보 체크 확인 후 "승인자 이름" 입력 → 승인 버튼
+```
+
+또는 CLI로 바로 승인:
+
+```bash
+python onsite_main.py approve --project my-site-001 --by "홍길동"
+```
+
+대본 미작성, 개인정보 체크 미완료 등 조건이 남아있으면 승인 자체가 거부됩니다.
+
+### 6. 최종 렌더링
+
+```bash
+python onsite_main.py render --project my-site-001
+```
+
+승인되지 않은 프로젝트는 **여기서 즉시 차단**됩니다 (예외 발생, 영상 생성 안 함).
+완성된 영상은 `output/onsite_<project>_<날짜>.mp4` (1080x1920, 9:16)에 저장됩니다.
+
+### 1차 MVP 범위
+
+- ✅ Before/작업중/After 사진 업로드 및 순서 지정
+- ✅ 사람이 직접 작성한 대본 입력 (AI 자동 생성 없음)
+- ✅ TTS 나레이션, SRT 자막 생성 및 영상 삽입
+- ✅ 기존 Ken Burns/영상 합성 엔진 재사용 (`video_generator.py`)
+- ✅ 개인정보 마스킹 체크리스트 + 최종 승인 전 렌더링 차단
+- ✅ 간단한 로컬 검수 화면 (`review_server.py`)
+- ⏭ 2차 예정: Gemini 자동 대본 생성, 정보형 슬라이드 모드, 서비스 100개 주제 데이터,
+  자동 개인정보 인식, 테마 커스터마이징, (자동 게시는 계획에 없음 — 항상 사람이 승인)
+
+---
+
+## 📌 원본 데모 기능 (업스트림 base, 참고용)
+
+아래는 이 저장소가 기반으로 삼은 원본 `simple-shorts-generator`의 데모 기능
+설명입니다 (`main.py --type quote|english|knowledge|motivation|custom`).
+기프트클린 파이프라인과는 별개이며, 2차에서 정보형 모드로 대체될 예정입니다.
 
 ## 📌 소개
 

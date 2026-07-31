@@ -5,6 +5,11 @@ config.yaml
 output/*.mp4
 output/_temp_slides/
 output/_temp_tts/
+output/_temp_onsite_*/
+
+# 현장형 프로젝트 데이터 (사진/대본/승인기록 - 개인정보 포함 가능, 커밋 금지)
+projects/*
+!projects/.gitkeep
 
 # Python
 __pycache__/
