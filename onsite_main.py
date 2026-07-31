@@ -22,14 +22,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime
 
 import approval
 import masking_check
+import onsite_branding
 import onsite_project
 import subtitle_generator
-from tts_generator import VOICES, generate_tts, resolve_voice
+from tts_generator import VOICES, _get_audio_duration, generate_tts, resolve_voice
 from video_generator import create_onsite_video
 
 DEFAULT_VOICE = "ko-female"
@@ -96,6 +98,16 @@ def cmd_check(args):
         print(f"   {mark} {masking_check.FIELD_LABELS[field]} 노출 없음/마스킹 완료")
 
 
+def cmd_set_duration(args):
+    seconds = args.seconds if args.seconds > 0 else None
+    onsite_project.set_duration_override(args.project, args.photo, seconds)
+    if seconds:
+        print(f"✅ '{args.photo}' 최소 노출시간을 {seconds:.1f}초로 지정했습니다. "
+              f"(나레이션이 더 길면 나레이션 길이가 우선 적용됩니다)")
+    else:
+        print(f"✅ '{args.photo}' 노출시간을 기본값으로 되돌렸습니다.")
+
+
 def cmd_audio(args):
     segments = onsite_project.ordered_script_segments(args.project)
     voice = resolve_voice(args.voice)
@@ -126,6 +138,62 @@ def cmd_audio(args):
         json.dump(tts_manifest, f, ensure_ascii=False, indent=2)
 
     print(f"✅ 나레이션 {len(tts_manifest)}개 + 자막 생성 완료")
+
+
+def cmd_import_audio(args):
+    """edge-tts/오프라인 TTS가 모두 안 될 때, 직접 녹음한 오디오 파일을 그 사진 자리에 넣는다."""
+    manifest = onsite_project.sorted_manifest(args.project)
+    match = next((m for m in manifest if m["filename"] == args.photo), None)
+    if not match:
+        print(f"❌ 매니페스트에 없는 사진입니다: {args.photo} (list 명령으로 확인)")
+        sys.exit(1)
+    if not os.path.exists(args.audio):
+        print(f"❌ 오디오 파일을 찾을 수 없습니다: {args.audio}")
+        sys.exit(1)
+
+    audio_dir = os.path.join(onsite_project.project_dir(args.project), "audio")
+    srt_dir = os.path.join(onsite_project.project_dir(args.project), "subtitles")
+    os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(srt_dir, exist_ok=True)
+
+    audio_path = os.path.join(audio_dir, f"seg_{match['order']:02d}.mp3")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", args.audio, audio_path], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"❌ 오디오 변환 실패: {result.stderr[:300]}")
+        sys.exit(1)
+    duration = _get_audio_duration(audio_path)
+
+    script_texts = onsite_project.parse_script(args.project, strict=False)
+    text = script_texts.get(args.photo, "")
+    srt_path = os.path.join(srt_dir, f"seg_{match['order']:02d}.srt")
+    subtitle_generator.generate_segment_srt(text, duration, srt_path)
+
+    manifest_path = _tts_manifest_path(args.project)
+    tts_manifest = []
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            tts_manifest = json.load(f)
+
+    tts_manifest = [e for e in tts_manifest if e["filename"] != args.photo]
+    tts_manifest.append({
+        "filename": match["filename"],
+        "photo_path": match["path"],
+        "audio_path": audio_path,
+        "srt_path": srt_path,
+        "duration": duration,
+    })
+    order_by_filename = {m["filename"]: m["order"] for m in manifest}
+    tts_manifest.sort(key=lambda e: order_by_filename.get(e["filename"], 0))
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(tts_manifest, f, ensure_ascii=False, indent=2)
+
+    print(f"✅ '{args.photo}' 오디오를 직접 녹음한 파일로 교체했습니다 (길이 {duration:.1f}초)")
+    if len(tts_manifest) < len(manifest):
+        missing = [m["filename"] for m in manifest if m["filename"] not in {e['filename'] for e in tts_manifest}]
+        print(f"⚠️  아직 나머지 사진의 오디오가 없습니다: {missing} (audio 명령 또는 import-audio로 채우세요)")
 
 
 def _build_review_packet(project_id: str) -> str:
@@ -195,9 +263,38 @@ def cmd_render(args):
     tts_data = [{"path": item["audio_path"], "duration": item["duration"]} for item in tts_manifest]
     subtitle_paths = [item["srt_path"] for item in tts_manifest]
 
+    manifest_by_filename = {item["filename"]: item for item in onsite_project.load_manifest(args.project)}
+    duration_overrides = [
+        manifest_by_filename.get(item["filename"], {}).get("duration_override")
+        for item in tts_manifest
+    ]
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
     output_path = args.output or os.path.join(OUTPUT_DIR, f"onsite_{args.project}_{today}.mp4")
+
+    logo_path = None
+    if not args.no_logo:
+        logo_path = onsite_branding.resolve_logo_path(args.logo)
+        if args.logo and not logo_path:
+            print(f"⚠️  지정한 로고 파일을 찾을 수 없어 로고 없이 진행합니다: {args.logo}")
+
+    cta_image_path = None
+    if not args.no_cta:
+        cta_dir = os.path.join(onsite_project.project_dir(args.project), "branding")
+        os.makedirs(cta_dir, exist_ok=True)
+        cta_image_path = onsite_branding.create_cta_slide(
+            os.path.join(cta_dir, "cta.png"),
+            main_text=args.cta_text,
+            sub_text=args.cta_subtext,
+        )
+
+    bgm_path = None
+    if args.bgm and args.bgm.lower() != "off":
+        name = None if args.bgm == "auto" else args.bgm
+        bgm_path = onsite_branding.find_bgm(name)
+        if not bgm_path:
+            print(f"⚠️  배경음악 파일을 찾을 수 없어 BGM 없이 진행합니다 (assets/bgm/ 확인).")
 
     result_path = create_onsite_video(
         photo_paths=photo_paths,
@@ -206,6 +303,12 @@ def cmd_render(args):
         subtitle_paths=subtitle_paths,
         fps=args.fps,
         transition_duration=args.transition,
+        duration_overrides=duration_overrides,
+        cta_image_path=cta_image_path,
+        cta_duration=args.cta_duration,
+        logo_path=logo_path,
+        bgm_path=bgm_path,
+        bgm_volume=args.bgm_volume,
     )
     print()
     print("=" * 50)
@@ -245,11 +348,27 @@ def build_parser():
     p_check.add_argument("--mail", choices=["yes", "no"])
     p_check.set_defaults(func=cmd_check)
 
+    p_duration = sub.add_parser("set-duration", help="사진별 최소 노출시간(초) 지정")
+    p_duration.add_argument("--project", required=True)
+    p_duration.add_argument("--photo", required=True, help="파일명 (list 명령으로 확인)")
+    p_duration.add_argument("--seconds", type=float, required=True,
+                             help="최소 노출시간(초). 0 이하면 기본값으로 되돌림")
+    p_duration.set_defaults(func=cmd_set_duration)
+
     p_audio = sub.add_parser("audio", help="script.txt 기반 TTS 나레이션 + SRT 자막 생성")
     p_audio.add_argument("--project", required=True)
     p_audio.add_argument("--voice", default=DEFAULT_VOICE, choices=list(VOICES.keys()) + list(VOICES.values()))
     p_audio.add_argument("--rate", default=DEFAULT_RATE)
     p_audio.set_defaults(func=cmd_audio)
+
+    p_import_audio = sub.add_parser(
+        "import-audio",
+        help="edge-tts/오프라인 TTS가 모두 실패할 때 직접 녹음한 오디오 파일로 대체",
+    )
+    p_import_audio.add_argument("--project", required=True)
+    p_import_audio.add_argument("--photo", required=True, help="파일명 (list 명령으로 확인)")
+    p_import_audio.add_argument("--audio", required=True, help="직접 녹음한 음성 파일 경로 (mp3/wav/m4a 등)")
+    p_import_audio.set_defaults(func=cmd_import_audio)
 
     p_review = sub.add_parser("review", help="검수 패킷(대본+체크리스트+승인상태) 출력")
     p_review.add_argument("--project", required=True)
@@ -266,6 +385,16 @@ def build_parser():
     p_render.add_argument("--output", default=None)
     p_render.add_argument("--fps", type=int, default=30)
     p_render.add_argument("--transition", type=float, default=0.5)
+    p_render.add_argument("--logo", default=None,
+                           help="로고 PNG 경로 (기본: assets/logo.png 있으면 자동 사용)")
+    p_render.add_argument("--no-logo", action="store_true", help="로고 오버레이 끄기")
+    p_render.add_argument("--cta-text", default=None, help="CTA 슬라이드 메인 문구")
+    p_render.add_argument("--cta-subtext", default=None, help="CTA 슬라이드 보조 문구")
+    p_render.add_argument("--cta-duration", type=float, default=3.0, help="CTA 슬라이드 노출시간(초)")
+    p_render.add_argument("--no-cta", action="store_true", help="CTA 엔딩 슬라이드 끄기")
+    p_render.add_argument("--bgm", default="off",
+                           help="배경음악: off(기본) | auto(assets/bgm 첫 곡) | 파일명/경로")
+    p_render.add_argument("--bgm-volume", type=float, default=0.12, help="배경음악 볼륨(0.0~1.0)")
     p_render.set_defaults(func=cmd_render)
 
     return parser

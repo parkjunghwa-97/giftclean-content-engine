@@ -40,13 +40,20 @@ def _escape_path_for_filter(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/").replace(":", "\\:")
 
 
-def _build_subtitle_filter(srt_path: str) -> str:
-    """SRT 자막을 화면 하단에 번인하는 subtitles 필터 문자열을 만듭니다."""
+def _build_subtitle_filter(srt_path: str, margin_v: int = 35) -> str:
+    """SRT 자막을 화면 하단 안전영역에 번인하는 subtitles 필터 문자열을 만듭니다.
+
+    margin_v=35는 1080x1920 기준 화면 하단에서 약 200px 위 지점으로,
+    쇼츠/릴스 플랫폼 UI(좋아요·공유 버튼 등)와 겹치지 않는 안전영역입니다.
+    (참고: 이 값은 libass의 기본 스크립트 해상도 기준 단위이며 실제 픽셀이 아닙니다 —
+    임의로 원본 해상도 리터럴 픽셀로 바꾸면 폰트 크기가 예기치 않게 커지므로
+    이 기존 스케일을 그대로 사용해 튜닝했습니다.)
+    """
     escaped = _escape_path_for_filter(srt_path)
     force_style = (
         "FontName=NanumGothic,FontSize=13,PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,BorderStyle=3,Outline=1,Shadow=0,"
-        "Alignment=2,MarginV=110"
+        f"Alignment=2,MarginV={margin_v}"
     )
     return f"subtitles='{escaped}':force_style='{force_style}'"
 
@@ -129,24 +136,25 @@ def _create_slide_clip(
     if tts_path:
         cmd = [
             "ffmpeg", "-y",
-            "-i", slide_path,
+            "-loop", "1", "-i", slide_path,
             "-i", tts_path,
             "-c:v", "libx264",
             "-c:a", "aac",
             "-b:a", "192k",
             "-t", str(duration),
             "-pix_fmt", "yuv420p",
+            "-r", str(fps),
             "-vf", vf,
-            "-shortest",
             output_path,
         ]
     else:
         cmd = [
             "ffmpeg", "-y",
-            "-i", slide_path,
+            "-loop", "1", "-i", slide_path,
             "-c:v", "libx264",
             "-t", str(duration),
             "-pix_fmt", "yuv420p",
+            "-r", str(fps),
             "-vf", vf,
             output_path,
         ]
@@ -177,7 +185,6 @@ def _create_slide_clip(
                 "-pix_fmt", "yuv420p",
                 "-r", str(fps),
                 "-vf", simple_vf,
-                "-shortest",
                 output_path,
             ]
         else:
@@ -408,6 +415,71 @@ def create_video(
         raise RuntimeError("영상 파일이 생성되지 않았습니다.")
 
 
+def _create_static_clip_with_silence(image_path: str, duration: float, output_path: str,
+                                      fps: int = 30, width: int = 1080, height: int = 1920) -> str:
+    """이미지 한 장 + 무음 오디오 트랙으로 정적 클립을 만듭니다 (CTA 엔딩 등).
+    다른 클립들과 동일한 코덱/스트림 구성이라 concat 이어붙이기가 안전합니다.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", image_path,
+        "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+        "-t", f"{duration:.3f}",
+        "-vf", f"scale={width}:{height}",
+        "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+def _overlay_logo(video_path: str, logo_path: str, output_path: str,
+                   margin: int = 30, logo_width: int = 160) -> str:
+    """영상 우상단에 로고를 작게 오버레이합니다."""
+    filter_complex = (
+        f"[1:v]scale={logo_width}:-1[logo];"
+        f"[0:v][logo]overlay=W-w-{margin}:{margin}"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", logo_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:a?",
+        "-c:v", "libx264", "-c:a", "copy",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"로고 오버레이 실패: {result.stderr[:300]}")
+    return output_path
+
+
+def _mix_bgm(video_path: str, bgm_path: str, bgm_volume: float, output_path: str) -> str:
+    """나레이션 오디오에 배경음악을 낮은 볼륨으로 믹싱합니다."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-stream_loop", "-1", "-i", bgm_path,
+        "-filter_complex",
+        f"[0:a]volume=1.0[narration];[1:a]volume={bgm_volume}[bgm];"
+        f"[narration][bgm]amix=inputs=2:duration=first:dropout_transition=0[a]",
+        "-map", "0:v",
+        "-map", "[a]",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"배경음악 믹싱 실패: {result.stderr[:300]}")
+    return output_path
+
+
 def create_onsite_video(
     photo_paths: list,
     output_path: str,
@@ -416,12 +488,24 @@ def create_onsite_video(
     fps: int = 30,
     transition_duration: float = 0.5,
     min_duration: float = 2.5,
+    duration_overrides: list | None = None,
+    cta_image_path: str | None = None,
+    cta_duration: float = 3.0,
+    logo_path: str | None = None,
+    bgm_path: str | None = None,
+    bgm_volume: float = 0.12,
 ) -> str:
     """현장형(Before/작업중/After 사진) 숏폼 영상을 합성합니다.
 
     photo_paths, tts_data, subtitle_paths는 반드시 같은 순서로 1:1 대응해야
     합니다 (사진 순서 = 대본 문단 순서 = 나레이션/자막 순서). 사진은 원본
     비율과 무관하게 스케일+크롭으로 9:16 프레임에 왜곡 없이 채워집니다.
+
+    duration_overrides: 사진별 최소 노출시간(초) 리스트. 값이 None인 항목은
+        min_duration을 사용합니다 (나레이션이 더 길면 나레이션 길이가 우선).
+    cta_image_path: 마지막에 붙일 CTA(브랜드 각인) 슬라이드 이미지. 무음 처리됩니다.
+    logo_path: 영상 전체에 우상단으로 작게 오버레이할 로고 PNG (투명배경 권장).
+    bgm_path: 배경음악 파일. 지정하면 나레이션과 낮은 볼륨으로 믹싱합니다.
     """
     if not _check_ffmpeg():
         print("❌ ffmpeg가 설치되어 있지 않습니다!")
@@ -439,6 +523,9 @@ def create_onsite_video(
     if subtitle_paths is not None and len(subtitle_paths) != len(photo_paths):
         raise ValueError("자막 파일 수가 사진 수와 일치하지 않습니다.")
 
+    if duration_overrides is not None and len(duration_overrides) != len(photo_paths):
+        raise ValueError("사진별 노출시간 목록 수가 사진 수와 일치하지 않습니다.")
+
     print("🎬 현장형 영상 생성 중... (사진 + TTS 나레이션 + 자막)")
 
     out_dir = os.path.dirname(output_path) or "."
@@ -450,7 +537,10 @@ def create_onsite_video(
     temp_videos = []
     for i, photo_path in enumerate(photo_paths):
         tts_info = tts_data[i]
-        clip_duration = max(tts_info["duration"] + 0.5, min_duration)
+        floor_duration = min_duration
+        if duration_overrides is not None and duration_overrides[i]:
+            floor_duration = duration_overrides[i]
+        clip_duration = max(tts_info["duration"] + 0.5, floor_duration)
         subtitle_path = subtitle_paths[i] if subtitle_paths else None
 
         temp_video = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
@@ -470,10 +560,19 @@ def create_onsite_video(
         temp_videos.append(temp_video)
         print(f"  📹 사진 {i + 1}/{len(photo_paths)} 변환 완료 ({clip_duration:.1f}초)")
 
+    if cta_image_path:
+        cta_clip = os.path.join(temp_dir, "clip_cta.mp4")
+        _create_static_clip_with_silence(cta_image_path, cta_duration, cta_clip, fps)
+        temp_videos.append(cta_clip)
+        print(f"  📹 CTA 엔딩 슬라이드 추가 ({cta_duration:.1f}초)")
+
     concat_file = os.path.join(temp_dir, "concat_list.txt")
     with open(concat_file, "w") as f:
         for video in temp_videos:
             f.write(f"file '{os.path.abspath(video)}'\n")
+
+    needs_postprocess = bool(logo_path or bgm_path)
+    concat_output = os.path.join(temp_dir, "concat_raw.mp4") if needs_postprocess else output_path
 
     cmd = [
         "ffmpeg", "-y",
@@ -483,14 +582,30 @@ def create_onsite_video(
         "-b:a", "192k",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        output_path,
+        concat_output,
     ]
-    print("  🔧 최종 영상 렌더링 중...")
+    print("  🔧 클립 합치는 중...")
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
         print(f"❌ 영상 생성 실패: {result.stderr[:500]}")
         raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+
+    current = concat_output
+
+    if logo_path:
+        print("  🏷️  로고 오버레이 적용 중...")
+        logo_output = os.path.join(temp_dir, "with_logo.mp4") if bgm_path else output_path
+        _overlay_logo(current, logo_path, logo_output)
+        current = logo_output
+
+    if bgm_path:
+        print(f"  🎵 배경음악 믹싱 중... ({os.path.basename(bgm_path)})")
+        _mix_bgm(current, bgm_path, bgm_volume, output_path)
+        current = output_path
+
+    if current != output_path:
+        shutil.move(current, output_path)
 
     print("  🧹 임시 파일 정리 중...")
     try:

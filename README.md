@@ -13,6 +13,9 @@ Before / 작업 중 / After 사진을 순서대로 올리고, 실제 현장 내�
 **대본·사진순서·개인정보 체크를 사람이 승인해야만 최종 렌더링이 진행되며,
 완전 무인 게시 기능은 없습니다.**
 
+> 윈도우에서 처음 실행해보시는 분은 [WINDOWS_GUIDE.md](WINDOWS_GUIDE.md)를 먼저 보세요
+> (설치부터 최종 영상까지 복사-실행 가능한 명령어로 정리되어 있습니다).
+
 ### 사전 준비
 
 ```bash
@@ -99,14 +102,43 @@ python onsite_main.py render --project my-site-001
 승인되지 않은 프로젝트는 **여기서 즉시 차단**됩니다 (예외 발생, 영상 생성 안 함).
 완성된 영상은 `output/onsite_<project>_<날짜>.mp4` (1080x1920, 9:16)에 저장됩니다.
 
+`render` 명령에는 아래 선택 옵션이 있습니다 (모두 생략 가능, 기본값으로도 동작):
+
+| 옵션 | 설명 | 기본값 |
+|---|---|---|
+| `--logo 경로` | 우상단에 작게 넣을 로고 PNG(투명배경 권장) | `assets/logo.png` 있으면 자동 사용 |
+| `--no-logo` | 로고 오버레이 끄기 | - |
+| `--cta-text`, `--cta-subtext` | 마지막 CTA 슬라이드 문구 | 기본 문구 사용 |
+| `--cta-duration` | CTA 슬라이드 노출시간(초) | 3.0 |
+| `--no-cta` | CTA 엔딩 슬라이드 끄기 | - |
+| `--bgm auto\|파일명\|off` | 배경음악. `auto`는 `assets/bgm/`의 첫 곡 사용 | `off` |
+| `--bgm-volume` | 배경음악 볼륨(0.0~1.0) | 0.12 |
+
+사진별 노출시간을 늘리고 싶으면(예: After 사진을 더 오래 보여주기) 렌더링 전에:
+
+```bash
+python onsite_main.py set-duration --project my-site-001 --photo 02_after.jpg --seconds 8
+```
+
+### edge-tts가 안 될 때 (오프라인/대체 방법)
+
+`audio` 명령은 edge-tts(온라인)가 실패하면 **자동으로 OS 내장 오프라인 음성(pyttsx3)**으로
+대체합니다 (`pip install pyttsx3` 필요, requirements.txt에 포함). 그것도 안 되거나
+음질이 마음에 안 들면, 직접 녹음한 파일을 그 사진 자리에 넣을 수 있습니다:
+
+```bash
+python onsite_main.py import-audio --project my-site-001 --photo 00_before.jpg --audio 내가녹음한파일.mp3
+```
+
 ### 1차 MVP 범위
 
 - ✅ Before/작업중/After 사진 업로드 및 순서 지정
 - ✅ 사람이 직접 작성한 대본 입력 (AI 자동 생성 없음)
-- ✅ TTS 나레이션, SRT 자막 생성 및 영상 삽입
+- ✅ TTS 나레이션(온라인 실패 시 오프라인/수동 녹음 대체), SRT 자막 생성 및 영상 삽입
 - ✅ 기존 Ken Burns/영상 합성 엔진 재사용 (`video_generator.py`)
 - ✅ 개인정보 마스킹 체크리스트 + 최종 승인 전 렌더링 차단
 - ✅ 간단한 로컬 검수 화면 (`review_server.py`)
+- ✅ 자막 하단 안전영역 배치, 로고 오버레이, CTA 엔딩 슬라이드, BGM 선택, 사진별 노출시간 조정
 - ⏭ 2차 예정: Gemini 자동 대본 생성, 정보형 슬라이드 모드, 서비스 100개 주제 데이터,
   자동 개인정보 인식, 테마 커스터마이징, (자동 게시는 계획에 없음 — 항상 사람이 승인)
 

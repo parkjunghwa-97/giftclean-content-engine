@@ -91,6 +91,32 @@ async def _generate_single_tts(
     return output_path, duration
 
 
+def _generate_offline_tts(text: str, output_path: str, rate: str = "+0%") -> tuple:
+    """edge-tts(온라인)를 쓸 수 없을 때 OS 내장 음성엔진(pyttsx3, 오프라인)으로 대체합니다.
+    Windows는 SAPI5, Mac은 NSSpeechSynthesizer, Linux는 espeak 음성을 사용합니다.
+    한국어 음성 품질/설치 여부는 OS 언어팩 설정에 따라 다릅니다.
+    """
+    import pyttsx3  # 선택 설치 패키지 (requirements.txt 참고)
+
+    engine = pyttsx3.init()
+    try:
+        rate_percent = int(rate.strip().replace("%", "").replace("+", ""))
+    except ValueError:
+        rate_percent = 0
+    base_rate = engine.getProperty("rate")
+    engine.setProperty("rate", int(base_rate * (1 + rate_percent / 100)))
+
+    tmp_wav = output_path + ".offline.wav"
+    engine.save_to_file(text, tmp_wav)
+    engine.runAndWait()
+
+    subprocess.run(["ffmpeg", "-y", "-i", tmp_wav, output_path], check=True, capture_output=True)
+    os.remove(tmp_wav)
+
+    duration = _get_audio_duration(output_path)
+    return output_path, duration
+
+
 def generate_tts(
     text: str,
     voice: str = "ko-KR-SunHiNeural",
@@ -98,7 +124,9 @@ def generate_tts(
     rate: str = "+0%",
 ) -> tuple:
     """
-    단일 텍스트에 대해 TTS를 생성합니다.
+    단일 텍스트에 대해 TTS를 생성합니다. edge-tts(무료, 온라인)를 우선 시도하고,
+    네트워크 문제 등으로 실패하면 OS 내장 오프라인 음성(pyttsx3)으로 자동 대체합니다.
+    그마저 안 되면 onsite_main.py의 import-audio 명령으로 직접 녹음한 파일을 쓰세요.
 
     Args:
         text: 변환할 텍스트
@@ -113,9 +141,25 @@ def generate_tts(
     if not clean_text:
         clean_text = "..."  # 빈 텍스트 방지
 
-    return asyncio.run(
-        _generate_single_tts(clean_text, voice, output_path, rate)
-    )
+    try:
+        return asyncio.run(
+            _generate_single_tts(clean_text, voice, output_path, rate)
+        )
+    except Exception as primary_error:
+        print(f"⚠️  edge-tts 생성 실패 ({primary_error}). 오프라인 음성으로 대체 시도 중...")
+        try:
+            return _generate_offline_tts(clean_text, output_path, rate)
+        except ImportError as e:
+            raise RuntimeError(
+                "edge-tts를 사용할 수 없고, 오프라인 대체(pyttsx3)도 설치되어 있지 않습니다. "
+                "'pip install pyttsx3'로 설치하거나, onsite_main.py import-audio 명령으로 "
+                "직접 녹음한 음성 파일을 사용하세요."
+            ) from e
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"오프라인 음성 생성도 실패했습니다: {fallback_error}. "
+                "onsite_main.py import-audio 명령으로 직접 녹음한 음성 파일을 사용하세요."
+            ) from fallback_error
 
 
 def resolve_voice(voice_setting: str) -> str:

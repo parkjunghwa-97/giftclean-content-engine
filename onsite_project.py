@@ -77,6 +77,7 @@ def import_photos(project_id: str, photos: list) -> list:
             "phase": phase,
             "order": idx,
             "original_name": os.path.basename(src_path),
+            "duration_override": None,
         })
 
     _save_manifest(project_id, items)
@@ -107,6 +108,17 @@ def reorder_photos(project_id: str, ordered_filenames: list) -> list:
     _save_manifest(project_id, reordered)
     _resync_script_template(project_id, reordered)
     return reordered
+
+
+def set_duration_override(project_id: str, filename: str, seconds: float | None) -> dict:
+    """사진별 최소 노출시간을 지정한다. seconds=None이면 기본값(min_duration)으로 되돌린다."""
+    items = load_manifest(project_id)
+    for item in items:
+        if item["filename"] == filename:
+            item["duration_override"] = seconds
+            _save_manifest(project_id, items)
+            return item
+    raise ValueError(f"매니페스트에 없는 파일명입니다: {filename}")
 
 
 def _segment_marker(order: int, phase: str, filename: str) -> str:
